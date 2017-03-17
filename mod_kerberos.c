@@ -4,6 +4,8 @@
 #include <gssapi/gssapi_krb5.h>
 #include <httpd.h>
 #include <http_config.h>
+#include <http_log.h>
+#include <http_request.h>
 #include <apr_hooks.h>
 #include <apr_strings.h>
 #include <apr_tables.h>
@@ -16,8 +18,18 @@ static const char* keytab_location;
 const char* set_keytab_location(cmd_parms* command, void* configuration, const char* argument)
 {
 	keytab_location = argument;
-	// TODO: test that keytab is readable.
 	return NULL;
+}
+
+static int verify_keytab_is_readable(apr_pool_t* configuration_pool, apr_pool_t* log_pool, apr_pool_t* temp_pool, server_rec* server)
+{
+	apr_file_t* file_handle = NULL;
+	apr_status_t result = apr_file_open(&file_handle, keytab_location, APR_FOPEN_READ, 0, temp_pool);
+	if(result == APR_SUCCESS)
+		apr_file_close(file_handle);
+	else
+		ap_log_error(APLOG_MARK, APLOG_CRIT, 0, server, "Unable to open keytab %s", keytab_location);
+	return OK;
 }
 
 static const command_rec directives[] = {
@@ -147,12 +159,13 @@ static int kerberos_handler(request_rec* request)
 	const char* header = apr_pstrcat(request->pool, "Negotiate ", encoded_response, NULL);
 	apr_table_set(request->err_headers_out, "WWW-Authenticate", header);
 	gss_release_buffer(&minor_status, &response);
-	return DECLINED; // TODO: figure out if we need to return OK or DECLINED. Ask Apache community.
+	return OK; // TODO: figure out if we need to return OK or DECLINED. Ask Apache community.
 }
 
 static void register_hooks(apr_pool_t* pool)
 {
-	ap_hook_handler(kerberos_handler, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_check_authn(kerberos_handler, NULL, NULL, APR_HOOK_MIDDLE, AP_AUTH_INTERNAL_PER_CONF);
+	ap_hook_post_config(verify_keytab_is_readable, NULL, NULL, APR_HOOK_FIRST);
 }
 
 module AP_MODULE_DECLARE_DATA kerberos_module =
