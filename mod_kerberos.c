@@ -13,29 +13,22 @@
 
 #include <stdio.h>
 
-static const char* keytab_location;
-
-const char* set_keytab_location(cmd_parms* command, void* configuration, const char* argument)
+struct configuration
 {
-	keytab_location = argument;
-	return NULL;
-}
+	int enabled;
+	const char* keytab_location;
+};
 
 static int verify_keytab_is_readable(apr_pool_t* configuration_pool, apr_pool_t* log_pool, apr_pool_t* temp_pool, server_rec* server)
 {
-	apr_file_t* file_handle = NULL;
+/*	apr_file_t* file_handle = NULL;
 	apr_status_t result = apr_file_open(&file_handle, keytab_location, APR_FOPEN_READ, 0, temp_pool);
 	if(result == APR_SUCCESS)
 		apr_file_close(file_handle);
 	else
-		ap_log_error(APLOG_MARK, APLOG_CRIT, 0, server, "Unable to open keytab %s", keytab_location);
+		ap_log_error(APLOG_MARK, APLOG_CRIT, 0, server, "Unable to open keytab %s", keytab_location);*/
 	return OK;
 }
-
-static const command_rec directives[] = {
-	AP_INIT_TAKE1("Keytab", set_keytab_location, NULL, OR_AUTHCFG, "The absolute file path of the web server's Kerberos keytab."),
-	{ NULL }
-};
 
 static void decode_error(FILE* output, char* title, OM_uint32 major_error, OM_uint32 minor_error)
 {
@@ -66,7 +59,7 @@ static void decode_error(FILE* output, char* title, OM_uint32 major_error, OM_ui
 	} while(context);
 }
 
-static gss_cred_id_t read_keytab(FILE* f)
+static gss_cred_id_t read_keytab(FILE* f, const char* keytab_location)
 {
 	OM_uint32 major_status = 0;
 	OM_uint32 minor_status = 0;
@@ -85,6 +78,17 @@ static gss_cred_id_t read_keytab(FILE* f)
 	decode_error(f, "Read keytab result:\n", major_status, minor_status);
 
 	return server_credentials;
+}
+
+static void release_resources(gss_ctx_id_t context, gss_name_t client_name, gss_buffer_desc response, gss_buffer_desc display_name, gss_cred_id_t server_credentials, FILE* f)
+{
+	OM_uint32 minor_status;
+	gss_delete_sec_context(&minor_status, &context, GSS_C_NO_BUFFER);
+	gss_release_name(&minor_status, &client_name);
+	gss_release_buffer(&minor_status, &response);
+	gss_release_buffer(&minor_status, &display_name);
+	gss_release_cred(&minor_status, &server_credentials);
+	fclose(f);
 }
 
 static int kerberos_handler(request_rec* request)
@@ -126,41 +130,65 @@ static int kerberos_handler(request_rec* request)
 	gss_ctx_id_t context = GSS_C_NO_CONTEXT;
 	gss_name_t client_name = GSS_C_NO_NAME;
 	gss_buffer_desc response = GSS_C_EMPTY_BUFFER;
-	gss_cred_id_t server_credentials = read_keytab(f);
+	gss_buffer_desc display_name = GSS_C_EMPTY_BUFFER;
+	gss_cred_id_t server_credentials = read_keytab(f, "/etc/krb5.keytab");
 
 	if(server_credentials == GSS_C_NO_CREDENTIAL)
 	{
 		fclose(f);
-		return HTTP_UNAUTHORIZED;
+		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
 	// Verify the user's credentials.
 	OM_uint32 major_status = gss_accept_sec_context(&minor_status, &context, server_credentials, &service_ticket, GSS_C_NO_CHANNEL_BINDINGS, &client_name, NULL, &response, NULL, NULL, NULL);
 
-	decode_error(f, "Accept security context result:\n", major_status, minor_status);
-
-	gss_delete_sec_context(&minor_status, &context, GSS_C_NO_BUFFER);
-	gss_release_name(&minor_status, &client_name);
-
-	fclose(f);
-
 	// If the credentials were invalid then tell the user they're not authorized.
 	if(major_status != GSS_S_COMPLETE)
 	{
-		gss_release_buffer(&minor_status, &response);
+		decode_error(f, "Accept security context result:\n", major_status, minor_status);
+		fprintf(f, "Credentials were invalid\n");
+		release_resources(context, client_name, display_name, response, server_credentials, f);
 		return HTTP_UNAUTHORIZED;
 	}
 
 	// The user has successfully authenticated when this point is reached.
+
+	// Get the user's name and inform Apache that the user has successfully authenticated.
+	major_status = gss_display_name(&minor_status, client_name, &display_name, NULL);
+	if(major_status != GSS_S_COMPLETE)
+	{
+		decode_error(f, "Display name result:\n", major_status, minor_status);
+		release_resources(context, client_name, display_name, response, server_credentials, f);
+		return HTTP_INTERNAL_SERVER_ERROR;
+	}
+	fprintf(f, "Display name is %s\n", (char*)display_name.value);
+	request->user = apr_pstrdup(request->pool, display_name.value);
+	request->ap_auth_type = "Kerberos";
+
 	// Encode the authentication response into base 64 and send it to the user.
 	int length = apr_base64_encode_len(response.length);
 	char* encoded_response = apr_pcalloc(request->pool, length);
 	apr_base64_encode(encoded_response, response.value, response.length);
 	const char* header = apr_pstrcat(request->pool, "Negotiate ", encoded_response, NULL);
 	apr_table_set(request->err_headers_out, "WWW-Authenticate", header);
-	gss_release_buffer(&minor_status, &response);
-	return OK; // TODO: figure out if we need to return OK or DECLINED. Ask Apache community.
+	fprintf(f, "Kerberos authentication successful!\n");
+	release_resources(context, client_name, display_name, response, server_credentials, f);
+	return OK;
 }
+
+static void* allocate_server_configuration(apr_pool_t* pool, server_rec* server_configuration)
+{
+	return apr_pcalloc(pool, sizeof(struct configuration));
+}
+
+const char* set_enabled(cmd_parms* command, void* config, int argument);
+const char* set_keytab_location(cmd_parms* command, void* config, const char* argument);
+
+static const command_rec directives[] = {
+	AP_INIT_FLAG("Kerberos", set_enabled, NULL, OR_AUTHCFG, "Determines if Kerberos authentication is enabled or disabled."),
+	AP_INIT_TAKE1("Keytab", set_keytab_location, NULL, RSRC_CONF, "The absolute file path of the web server's Kerberos keytab."),
+	{ NULL }
+};
 
 static void register_hooks(apr_pool_t* pool)
 {
@@ -171,10 +199,24 @@ static void register_hooks(apr_pool_t* pool)
 module AP_MODULE_DECLARE_DATA kerberos_module =
 {
 	STANDARD20_MODULE_STUFF,
-	NULL,
-	NULL,
-	NULL,
-	NULL,
+	NULL, // Per-directory configuration allocator
+	NULL, // Per-directory configuration merge handler
+	allocate_server_configuration,
+	NULL, // Per-server configuration merge handler
 	directives,
 	register_hooks
 };
+
+const char* set_enabled(cmd_parms* command, void* config, int argument)
+{
+	struct configuration* c = ap_get_module_config(command->server->module_config, &kerberos_module);
+	c->enabled = argument;
+	return NULL;
+}
+
+const char* set_keytab_location(cmd_parms* command, void* config, const char* argument)
+{
+	struct configuration* c = ap_get_module_config(command->server->module_config, &kerberos_module);
+	c->keytab_location = argument;
+	return NULL;
+}
