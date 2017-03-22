@@ -11,8 +11,6 @@
 #include <apr_tables.h>
 #include <apr_base64.h>
 
-#include <stdio.h>
-
 struct configuration
 {
 	int enabled;
@@ -30,15 +28,12 @@ static int verify_keytab_is_readable(apr_pool_t* configuration_pool, apr_pool_t*
 	return OK;
 }
 
-static void decode_error(FILE* output, char* title, OM_uint32 major_error, OM_uint32 minor_error)
+static void decode_error(request_rec* request, const char* title, OM_uint32 major_error, OM_uint32 minor_error)
 {
-	if(title)
-		fprintf(output, "%s", title);
 	if(major_error == GSS_S_COMPLETE)
-	{
-		fprintf(output, "Success\n");
 		return;
-	}
+	if(title)
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, request, "%s", title);
 	OM_uint32 minor_status = 0;
 	gss_buffer_desc status_string = GSS_C_EMPTY_BUFFER;
 	OM_uint32 context = 0;
@@ -48,19 +43,21 @@ static void decode_error(FILE* output, char* title, OM_uint32 major_error, OM_ui
 	{
 		do {
 			gss_display_status(&minor_status, major_error, GSS_C_GSS_CODE, GSS_C_NULL_OID, &context, &status_string);
-			fprintf(output, "GSS error: %s\n", (char*)status_string.value);
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, request, "GSS error: %s", (char*)status_string.value);
 			gss_release_buffer(&minor_status, &status_string);
 		} while(context);
 	}
 	do {
 		gss_display_status(&minor_status, minor_error, GSS_C_MECH_CODE, GSS_C_NULL_OID, &context, &status_string);
-		fprintf(output, "Kerberos error: %s\n", (char*)status_string.value);
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, request, "Kerberos error: %s", (char*)status_string.value);
 		gss_release_buffer(&minor_status, &status_string);
 	} while(context);
 }
 
-static gss_cred_id_t read_keytab(FILE* f, const char* keytab_location)
+static gss_cred_id_t read_keytab(request_rec* request)
 {
+	const char* keytab_location = "/etc/combined.keytab";
+
 	OM_uint32 major_status = 0;
 	OM_uint32 minor_status = 0;
 
@@ -75,12 +72,26 @@ static gss_cred_id_t read_keytab(FILE* f, const char* keytab_location)
 	gss_cred_id_t server_credentials = GSS_C_NO_CREDENTIAL;
 	major_status = gss_acquire_cred_from(&minor_status, GSS_C_NO_NAME, GSS_C_INDEFINITE, GSS_C_NO_OID_SET, GSS_C_ACCEPT, &credential_store, &server_credentials, NULL, NULL);
 
-	decode_error(f, "Read keytab result:\n", major_status, minor_status);
+	if(major_status == GSS_S_COMPLETE)
+	{
+		gss_name_t server_credential_name = GSS_C_NO_NAME;
+		gss_inquire_cred(&minor_status, server_credentials, &server_credential_name, NULL, NULL, NULL);
+		gss_buffer_desc display_name = GSS_C_EMPTY_BUFFER;
+		gss_display_name(&minor_status, server_credential_name, &display_name, NULL);
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, request, "Successfully obtained server credentials named %s from keytab %s", (char*)display_name.value, keytab_location);
+		gss_release_name(&minor_status, &server_credential_name);
+		gss_release_buffer(&minor_status, &display_name);
+	}
+	else
+	{
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, request, "Could not read server credentials from keytab %s", keytab_location);
+		decode_error(request, NULL, major_status, minor_status);
+	}
 
 	return server_credentials;
 }
 
-static void release_resources(gss_ctx_id_t context, gss_name_t client_name, gss_buffer_desc response, gss_buffer_desc display_name, gss_cred_id_t server_credentials, FILE* f)
+static void release_resources(gss_ctx_id_t context, gss_name_t client_name, gss_buffer_desc response, gss_buffer_desc display_name, gss_cred_id_t server_credentials)
 {
 	OM_uint32 minor_status;
 	gss_delete_sec_context(&minor_status, &context, GSS_C_NO_BUFFER);
@@ -88,7 +99,6 @@ static void release_resources(gss_ctx_id_t context, gss_name_t client_name, gss_
 	gss_release_buffer(&minor_status, &response);
 	gss_release_buffer(&minor_status, &display_name);
 	gss_release_cred(&minor_status, &server_credentials);
-	fclose(f);
 }
 
 static int kerberos_handler(request_rec* request)
@@ -118,9 +128,6 @@ static int kerberos_handler(request_rec* request)
 	if(strcmp(tokens[0], "Negotiate"))
 		return HTTP_UNAUTHORIZED;
 
-	// For debugging:
-	FILE* f = fopen("/tmp/kerberos.txt", "w");
-
 	// Decode the base 64 service ticket.
 	gss_buffer_desc service_ticket = GSS_C_EMPTY_BUFFER;
 	service_ticket.value = apr_pcalloc(request->pool, apr_base64_decode_len(tokens[1]));
@@ -131,13 +138,10 @@ static int kerberos_handler(request_rec* request)
 	gss_name_t client_name = GSS_C_NO_NAME;
 	gss_buffer_desc response = GSS_C_EMPTY_BUFFER;
 	gss_buffer_desc display_name = GSS_C_EMPTY_BUFFER;
-	gss_cred_id_t server_credentials = read_keytab(f, "/etc/krb5.keytab");
+	gss_cred_id_t server_credentials = read_keytab(request);
 
 	if(server_credentials == GSS_C_NO_CREDENTIAL)
-	{
-		fclose(f);
 		return HTTP_INTERNAL_SERVER_ERROR;
-	}
 
 	// Verify the user's credentials.
 	OM_uint32 major_status = gss_accept_sec_context(&minor_status, &context, server_credentials, &service_ticket, GSS_C_NO_CHANNEL_BINDINGS, &client_name, NULL, &response, NULL, NULL, NULL);
@@ -145,23 +149,21 @@ static int kerberos_handler(request_rec* request)
 	// If the credentials were invalid then tell the user they're not authorized.
 	if(major_status != GSS_S_COMPLETE)
 	{
-		decode_error(f, "Accept security context result:\n", major_status, minor_status);
-		fprintf(f, "Credentials were invalid\n");
-		release_resources(context, client_name, display_name, response, server_credentials, f);
+		decode_error(request, "Kerberos authentication failed for this user.", major_status, minor_status);
+		release_resources(context, client_name, display_name, response, server_credentials);
 		return HTTP_UNAUTHORIZED;
 	}
 
 	// The user has successfully authenticated when this point is reached.
 
-	// Get the user's name and inform Apache that the user has successfully authenticated.
+	// Get the user's name and inform HTTPD that the user has successfully authenticated.
 	major_status = gss_display_name(&minor_status, client_name, &display_name, NULL);
 	if(major_status != GSS_S_COMPLETE)
 	{
-		decode_error(f, "Display name result:\n", major_status, minor_status);
-		release_resources(context, client_name, display_name, response, server_credentials, f);
+		decode_error(request, "The user successfully authenticated, but the user's display name could not be obtained from GSSAPI.", major_status, minor_status);
+		release_resources(context, client_name, display_name, response, server_credentials);
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
-	fprintf(f, "Display name is %s\n", (char*)display_name.value);
 	request->user = apr_pstrdup(request->pool, display_name.value);
 	request->ap_auth_type = "Kerberos";
 
@@ -171,8 +173,8 @@ static int kerberos_handler(request_rec* request)
 	apr_base64_encode(encoded_response, response.value, response.length);
 	const char* header = apr_pstrcat(request->pool, "Negotiate ", encoded_response, NULL);
 	apr_table_set(request->err_headers_out, "WWW-Authenticate", header);
-	fprintf(f, "Kerberos authentication successful!\n");
-	release_resources(context, client_name, display_name, response, server_credentials, f);
+	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, request, "Kerberos authentication for %s was successful!", request->user);
+	release_resources(context, client_name, display_name, response, server_credentials);
 	return OK;
 }
 
@@ -196,7 +198,7 @@ static void register_hooks(apr_pool_t* pool)
 	ap_hook_post_config(verify_keytab_is_readable, NULL, NULL, APR_HOOK_FIRST);
 }
 
-module AP_MODULE_DECLARE_DATA kerberos_module =
+AP_DECLARE_MODULE(kerberos) =
 {
 	STANDARD20_MODULE_STUFF,
 	NULL, // Per-directory configuration allocator
