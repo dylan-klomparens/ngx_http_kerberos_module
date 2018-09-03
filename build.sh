@@ -1,7 +1,7 @@
-cd /Users/dylan/Desktop/nginx-1.14.0
+cd /home/dylan/Code/nginx-1.14.0
 
 ./configure \
---add-module=/Users/dylan/CLionProjects/nginx_kerberos \
+--add-module=/home/dylan/code/mod_kerberos \
 --without-http_rewrite_module \
 --prefix=. \
 --conf-path=configuration \
@@ -12,4 +12,4 @@ cd /Users/dylan/Desktop/nginx-1.14.0
 
 make
 
-cp -f objs/nginx /Users/dylan/CLionProjects/nginx_kerberos/nginx
+cp -f objs/nginx /home/dylan/Code/mod_kerberos/nginx
