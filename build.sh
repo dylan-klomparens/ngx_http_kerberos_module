@@ -1,8 +1,9 @@
 cd /home/dylan/Code/nginx-1.14.0
 
 ./configure \
---add-module=/home/dylan/code/mod_kerberos \
+--add-module=/home/dylan/Code/mod_kerberos \
 --without-http_rewrite_module \
+--without-http_gzip_module \
 --prefix=. \
 --conf-path=configuration \
 --http-log-path=stdout \
