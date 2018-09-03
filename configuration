@@ -1,0 +1,19 @@
+daemon off;
+
+events {}
+
+http {
+	server {
+		listen 8000;
+	    kerberos on;
+	    keytab /some/thing;
+
+	    location /x {
+	        kerberos off;
+	    }
+
+	    location /y {
+	        keytab /else;
+	    }
+	}
+}
