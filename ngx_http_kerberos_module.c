@@ -13,7 +13,7 @@ static ngx_command_t directives[] =
 {
 	{
 		ngx_string("kerberos"),
-		NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_FLAG,
+		NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
 		ngx_conf_set_flag_slot,
 		NGX_HTTP_LOC_CONF_OFFSET,
 		offsetof(module_configuration, enabled),
@@ -21,7 +21,7 @@ static ngx_command_t directives[] =
 	},
 	{
 		ngx_string("keytab"),
-		NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_FLAG,
+		NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
 		ngx_conf_set_str_slot,
 		NGX_HTTP_LOC_CONF_OFFSET,
 		offsetof(module_configuration, keytab),
@@ -129,39 +129,10 @@ static gss_cred_id_t read_keytab(ngx_log_t* log)
 	return server_credentials;
 }
 
-static void release_resources(gss_ctx_id_t context, gss_name_t client_name, gss_buffer_desc response, gss_buffer_desc display_name, gss_cred_id_t server_credentials)
+static gss_buffer_desc decode_service_ticket(ngx_str_t encoded_service_ticket)
 {
-	OM_uint32 minor_status;
-	gss_delete_sec_context(&minor_status, &context, GSS_C_NO_BUFFER);
-	gss_release_name(&minor_status, &client_name);
-	gss_release_buffer(&minor_status, &response);
-	gss_release_buffer(&minor_status, &display_name);
-	gss_release_cred(&minor_status, &server_credentials);
-}
-
-static ngx_int_t handle_request(ngx_http_request_t* request)
-{
-	module_configuration* contextual_configuration = ngx_http_get_module_loc_conf(request, ngx_http_kerberos_module);
-	if(!contextual_configuration->enabled)
-		return NGX_DECLINED;
-
-	// The incoming HTTP request should contain an "Authorization" header with the
-	// value "Negotiate" to indicate the user intends to use Kerberos.
-	// If it does not we can reply with a "WWW-Authenticate" header set to "Negotiate"
-	// to indicate that the server accepts Kerberos authentication.
-	if(!request->headers_in.authorization)
-	{
-		request->headers_out.www_authenticate = ngx_list_push(&request->headers_out.headers);
-		request->headers_out.www_authenticate->hash = 1;
-		ngx_str_set(&request->headers_out.www_authenticate->key, "WWW-Authenticate");
-		ngx_str_set(&request->headers_out.www_authenticate->value, "Negotiate");
-		return NGX_OK;
-	}
-
-	// Decode the base 64 service ticket.
-	ngx_str_t encoded_service_ticket = request->headers_in.authorization->value;
 	if(ngx_strncasecmp(encoded_service_ticket.data, (u_char *)"Negotiate", sizeof("Negotiate")))
-		return NGX_DECLINED;
+		return GSS_C_EMPTY_BUFFER;
 	encoded_service_ticket.len -= sizeof("Negotiate");
 	encoded_service_ticket.data += sizeof("Negotiate");
 	while(encoded_service_ticket.len && encoded_service_ticket.data[0] == ' ')
@@ -169,18 +140,16 @@ static ngx_int_t handle_request(ngx_http_request_t* request)
 		encoded_service_ticket.len--;
 		encoded_service_ticket.data++;
 	}
-	ngx_str_t decoded;
-	decoded.len = ngx_base64_decoded_length(encoded_service_ticket.len);
-	decoded.data = ngx_pcalloc(request->pool, decoded.len);
-	ngx_decode_base64(&decoded, &encoded_service_ticket);
-	gss_buffer_desc service_ticket = { .value = decoded.data, .length = decoded.len };
-	if(service_ticket.value)
-		return NGX_OK;
+	ngx_str_t decoded_service_ticket;
+	decoded_service_ticket.len = ngx_base64_decoded_length(encoded_service_ticket.len);
+	decoded_service_ticket.data = ngx_pcalloc(request->pool, decoded_service_ticket.len);
+	ngx_decode_base64(&decoded_service_ticket, &encoded_service_ticket);
+	gss_buffer_desc service_ticket = { .value = decoded_service_ticket.data, .length = decoded_service_ticket.len };
+	return service_ticket;
+}
 
-	gss_cred_id_t server_credentials = read_keytab(request->connection->log);
-	if(server_credentials == GSS_C_NO_CREDENTIAL)
-		return NGX_ERROR;
-
+static gss_buffer_desc authenticate(server_credentials, service_ticket)
+{
 	OM_uint32 minor_status = 0;
 	gss_ctx_id_t context = GSS_C_NO_CONTEXT;
 	gss_name_t client_name = GSS_C_NO_NAME;
@@ -210,8 +179,48 @@ static ngx_int_t handle_request(ngx_http_request_t* request)
 		release_resources(context, client_name, display_name, response, server_credentials);
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	}
-//	request->user = apr_pstrdup(request->pool, display_name.value);
-//	request->ap_auth_type = "Kerberos";
+
+	return response;
+}
+
+static void release_resources(gss_ctx_id_t context, gss_name_t client_name, gss_buffer_desc response, gss_buffer_desc display_name, gss_cred_id_t server_credentials)
+{
+	OM_uint32 minor_status;
+	gss_delete_sec_context(&minor_status, &context, GSS_C_NO_BUFFER);
+	gss_release_name(&minor_status, &client_name);
+	gss_release_buffer(&minor_status, &response);
+	gss_release_buffer(&minor_status, &display_name);
+	gss_release_cred(&minor_status, &server_credentials);
+}
+
+static ngx_int_t handle_request(ngx_http_request_t* request)
+{
+	module_configuration* contextual_configuration = ngx_http_get_module_loc_conf(request, ngx_http_kerberos_module);
+	if(!contextual_configuration->enabled)
+		return NGX_DECLINED;
+
+	// The incoming HTTP request should contain an "Authorization" header with the
+	// value "Negotiate" to indicate the user intends to use Kerberos.
+	// If it does not we can reply with a "WWW-Authenticate" header set to "Negotiate"
+	// to indicate that the server accepts Kerberos authentication.
+	if(!request->headers_in.authorization)
+	{
+		request->headers_out.www_authenticate = ngx_list_push(&request->headers_out.headers);
+		request->headers_out.www_authenticate->hash = 1;
+		ngx_str_set(&request->headers_out.www_authenticate->key, "WWW-Authenticate");
+		ngx_str_set(&request->headers_out.www_authenticate->value, "Negotiate");
+		return NGX_OK;
+	}
+
+	gss_cred_id_t server_credentials = read_keytab(request->connection->log);
+	if(server_credentials == GSS_C_NO_CREDENTIAL)
+		return NGX_ERROR;
+
+	gss_buffer_desc service_ticket = decode_service_ticket(request->headers_in.authorization->value);
+	if(service_ticket == GSS_C_EMPTY_BUFFER)
+		return NGX_DECLINED;
+
+
 
 	// Encode the authentication response into base 64 and send it to the user.
 	ngx_str_t encoded_response;
