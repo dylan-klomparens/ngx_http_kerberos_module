@@ -2,7 +2,7 @@ This project is not suitable for production environments.
 
 A Kerberos authentication module for Nginx, designed to be easy to use, quick to setup and deploy, and highly secure.
 
-#### Directives
+### Directives
 
 **kerberos** - enable or disable Kerberos authentication  
 Syntax: kerberos on | off;  
