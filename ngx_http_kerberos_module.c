@@ -114,7 +114,7 @@ static gss_cred_id_t read_keytab(const char* keytab_location, ngx_log_t* log)
 		gss_inquire_cred(&minor_status, server_credentials, &server_credential_name, NULL, NULL, NULL);
 		gss_buffer_desc display_name = GSS_C_EMPTY_BUFFER;
 		gss_display_name(&minor_status, server_credential_name, &display_name, NULL);
-		ngx_log_error(NGX_LOG_DEBUG, log, 0, "Successfully obtained server credentials named %s from keytab %s", (char*)display_name.value, keytab_location);
+		ngx_log_error(NGX_LOG_INFO, log, 0, "Successfully obtained server credentials named %s from keytab %s", (char*)display_name.value, keytab_location);
 		gss_release_name(&minor_status, &server_credential_name);
 		gss_release_buffer(&minor_status, &display_name);
 	}
@@ -189,7 +189,7 @@ static ngx_int_t handle_request(ngx_http_request_t* request)
     // If the credentials were invalid then tell the user they're not authenticated.
     if(major_status != GSS_S_COMPLETE)
     {
-        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "Kerberos authentication failed for this user");
+        ngx_log_error(NGX_LOG_NOTICE, request->connection->log, 0, "Kerberos authentication failed for this user");
         decode_error(request->connection->log, major_status, minor_status);
         release_resources(context, client_name, display_name, response, server_credentials);
         return NGX_HTTP_UNAUTHORIZED;
@@ -216,7 +216,7 @@ static ngx_int_t handle_request(ngx_http_request_t* request)
 	request->headers_out.www_authenticate->hash = 1;
 	ngx_str_set(&request->headers_out.www_authenticate->key, "WWW-Authenticate");
 	request->headers_out.www_authenticate->value = encoded_response;
-	ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "Kerberos authentication for %s was successful!", display_name.value);
+	ngx_log_error(NGX_LOG_INFO, request->connection->log, 0, "Kerberos authentication for %s was successful!", display_name.value);
 	release_resources(context, client_name, display_name, response, server_credentials);
 
 	return NGX_OK;
