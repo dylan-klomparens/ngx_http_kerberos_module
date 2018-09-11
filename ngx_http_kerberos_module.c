@@ -242,6 +242,6 @@ static char* merge_location_configuration(ngx_conf_t* nginx_configuration, void*
 	module_configuration* prev = parent;
 	module_configuration* conf = child;
 	ngx_conf_merge_off_value(conf->enabled, prev->enabled, 0);
-	ngx_conf_merge_str_value(conf->keytab, prev->keytab, "/etc/krb5.keytab");
+	ngx_conf_merge_str_value(conf->keytab, prev->keytab, "");
 	return NGX_CONF_OK;
 }
