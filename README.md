@@ -5,14 +5,14 @@ A Kerberos authentication module for Nginx, designed to be easy to use, quick to
 ### Directives
 
 **kerberos** - enable or disable Kerberos authentication  
-Syntax: kerberos on | off;  
-Default: kerberos off;  
-context: http, server, location  
+Syntax: `kerberos on | off;`  
+Default: `kerberos off;`  
+Context: `http, server, location`  
 
 **keytab** - specify the location of the keytab to use  
-Syntax: keytab /path/to/keytab/file;  
-Default: none  
-context: http, server, location  
+Syntax: `keytab /path/to/keytab/file;`  
+Default: `none - you must specify a keytab`  
+Context: `http, server, location`  
 
 #### Example configurations
 
