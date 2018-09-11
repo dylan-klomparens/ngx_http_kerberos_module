@@ -92,10 +92,8 @@ static void decode_error(ngx_log_t* log, OM_uint32 major_error, OM_uint32 minor_
 	} while(context);
 }
 
-static gss_cred_id_t read_keytab(ngx_log_t* log)
+static gss_cred_id_t read_keytab(const char* keytab_location, ngx_log_t* log)
 {
-	const char* keytab_location = "/etc/combined.keytab";
-
 	OM_uint32 major_status = 0;
 	OM_uint32 minor_status = 0;
 
@@ -129,60 +127,6 @@ static gss_cred_id_t read_keytab(ngx_log_t* log)
 	return server_credentials;
 }
 
-static gss_buffer_desc decode_service_ticket(ngx_str_t encoded_service_ticket)
-{
-	if(ngx_strncasecmp(encoded_service_ticket.data, (u_char *)"Negotiate", sizeof("Negotiate")))
-		return GSS_C_EMPTY_BUFFER;
-	encoded_service_ticket.len -= sizeof("Negotiate");
-	encoded_service_ticket.data += sizeof("Negotiate");
-	while(encoded_service_ticket.len && encoded_service_ticket.data[0] == ' ')
-	{
-		encoded_service_ticket.len--;
-		encoded_service_ticket.data++;
-	}
-	ngx_str_t decoded_service_ticket;
-	decoded_service_ticket.len = ngx_base64_decoded_length(encoded_service_ticket.len);
-	decoded_service_ticket.data = ngx_pcalloc(request->pool, decoded_service_ticket.len);
-	ngx_decode_base64(&decoded_service_ticket, &encoded_service_ticket);
-	gss_buffer_desc service_ticket = { .value = decoded_service_ticket.data, .length = decoded_service_ticket.len };
-	return service_ticket;
-}
-
-static gss_buffer_desc authenticate(server_credentials, service_ticket)
-{
-	OM_uint32 minor_status = 0;
-	gss_ctx_id_t context = GSS_C_NO_CONTEXT;
-	gss_name_t client_name = GSS_C_NO_NAME;
-	gss_buffer_desc response = GSS_C_EMPTY_BUFFER;
-	gss_buffer_desc display_name = GSS_C_EMPTY_BUFFER;
-
-	// Verify the user's credentials.
-	OM_uint32 major_status = gss_accept_sec_context(&minor_status, &context, server_credentials, &service_ticket, GSS_C_NO_CHANNEL_BINDINGS, &client_name, NULL, &response, NULL, NULL, NULL);
-
-	// If the credentials were invalid then tell the user they're not authenticated.
-	if(major_status != GSS_S_COMPLETE)
-	{
-		ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "Kerberos authentication failed for this user");
-		decode_error(request->connection->log, major_status, minor_status);
-		release_resources(context, client_name, display_name, response, server_credentials);
-		return NGX_HTTP_UNAUTHORIZED;
-	}
-
-	// The user has successfully authenticated when this point is reached.
-
-	// Get the user's name and inform Nginx that the user has successfully authenticated.
-	major_status = gss_display_name(&minor_status, client_name, &display_name, NULL);
-	if(major_status != GSS_S_COMPLETE)
-	{
-		ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "The user successfully authenticated, but the user's display name could not be obtained from GSSAPI");
-		decode_error(request->connection->log, major_status, minor_status);
-		release_resources(context, client_name, display_name, response, server_credentials);
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	}
-
-	return response;
-}
-
 static void release_resources(gss_ctx_id_t context, gss_name_t client_name, gss_buffer_desc response, gss_buffer_desc display_name, gss_cred_id_t server_credentials)
 {
 	OM_uint32 minor_status;
@@ -212,26 +156,67 @@ static ngx_int_t handle_request(ngx_http_request_t* request)
 		return NGX_OK;
 	}
 
-	gss_cred_id_t server_credentials = read_keytab(request->connection->log);
+	gss_cred_id_t server_credentials = read_keytab((const char*)contextual_configuration->keytab.data, request->connection->log);
 	if(server_credentials == GSS_C_NO_CREDENTIAL)
-		return NGX_ERROR;
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
-	gss_buffer_desc service_ticket = decode_service_ticket(request->headers_in.authorization->value);
-	if(service_ticket == GSS_C_EMPTY_BUFFER)
-		return NGX_DECLINED;
+    // Decode the base 64 service ticket.
+	ngx_str_t encoded_service_ticket = request->headers_in.authorization->value;
+    if(ngx_strncasecmp(encoded_service_ticket.data, (u_char*)"Negotiate", sizeof("Negotiate")))
+        return NGX_DECLINED;
+    encoded_service_ticket.len -= sizeof("Negotiate");
+    encoded_service_ticket.data += sizeof("Negotiate");
+    while(encoded_service_ticket.len && encoded_service_ticket.data[0] == ' ')
+    {
+        encoded_service_ticket.len--;
+        encoded_service_ticket.data++;
+    }
+    ngx_str_t decoded_service_ticket;
+    decoded_service_ticket.len = ngx_base64_decoded_length(encoded_service_ticket.len);
+    decoded_service_ticket.data = ngx_pcalloc(request->pool, decoded_service_ticket.len);
+    ngx_decode_base64(&decoded_service_ticket, &encoded_service_ticket);
+    gss_buffer_desc service_ticket = { .value = decoded_service_ticket.data, .length = decoded_service_ticket.len };
 
+    OM_uint32 minor_status = 0;
+    gss_ctx_id_t context = GSS_C_NO_CONTEXT;
+    gss_name_t client_name = GSS_C_NO_NAME;
+    gss_buffer_desc response = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc display_name = GSS_C_EMPTY_BUFFER;
 
+    // Verify the user's credentials.
+    OM_uint32 major_status = gss_accept_sec_context(&minor_status, &context, server_credentials, &service_ticket, GSS_C_NO_CHANNEL_BINDINGS, &client_name, NULL, &response, NULL, NULL, NULL);
+
+    // If the credentials were invalid then tell the user they're not authenticated.
+    if(major_status != GSS_S_COMPLETE)
+    {
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "Kerberos authentication failed for this user");
+        decode_error(request->connection->log, major_status, minor_status);
+        release_resources(context, client_name, display_name, response, server_credentials);
+        return NGX_HTTP_UNAUTHORIZED;
+    }
+
+    // The user has successfully authenticated when this point is reached.
+
+    // Get the user's name and inform Nginx that the user has successfully authenticated.
+    major_status = gss_display_name(&minor_status, client_name, &display_name, NULL);
+    if(major_status != GSS_S_COMPLETE)
+    {
+        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "The user successfully authenticated, but the user's display name could not be obtained from GSSAPI");
+        decode_error(request->connection->log, major_status, minor_status);
+        release_resources(context, client_name, display_name, response, server_credentials);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
 	// Encode the authentication response into base 64 and send it to the user.
 	ngx_str_t encoded_response;
 	encoded_response.len = ngx_base64_encoded_length(response.length);
 	encoded_response.data = ngx_pcalloc(request->pool, encoded_response.len);
-	ngx_encode_base64(&encoded_response, &response);
+	ngx_encode_base64(&encoded_response, &((ngx_str_t){ .data = response.value, .len = response.length }));
 	request->headers_out.www_authenticate = ngx_list_push(&request->headers_out.headers);
 	request->headers_out.www_authenticate->hash = 1;
 	ngx_str_set(&request->headers_out.www_authenticate->key, "WWW-Authenticate");
-	request->headers_out.www_authenticate = encoded_response;
-	ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "Kerberos authentication for %s was successful!", request->user);
+	request->headers_out.www_authenticate->value = encoded_response;
+	ngx_log_error(NGX_LOG_ERR, request->connection->log, 0, "Kerberos authentication for %s was successful!", display_name.value);
 	release_resources(context, client_name, display_name, response, server_credentials);
 
 	return NGX_OK;
